@@ -21,6 +21,9 @@ import { ProductosService } from '../productos/productos.service';
 import { MoneyUtil } from '../../common/utils/money.util';
 import { ClientesService } from '../clientes/clientes.service';
 import { WhatsappService } from '../whatsapp/whatsapp.service';
+import { ValidationService } from '../../common/services/validation.service';
+import { PuntosService } from '../puntos/puntos.service';
+import { InventarioService } from '../inventario/inventario.service';
 
 /**
  * Interfaz que representa un producto validado y procesado para una venta
@@ -33,6 +36,7 @@ interface ProductoValidado {
   precioUnitario: number;
   subtotal: number;
   valorPuntos: number;
+  stockDisponible: number;
 }
 
 /**
@@ -69,6 +73,9 @@ export class VentasService {
     private clientesService: ClientesService,
     private whatsappService: WhatsappService,
     private dataSource: DataSource,
+    private validationService: ValidationService,
+    private puntosService: PuntosService,
+    private inventarioService: InventarioService,
   ) {}
 
   /**
@@ -114,20 +121,42 @@ export class VentasService {
         totalPagado, // Usar el monto real calculado desde métodos de pago
       );
 
-      // ===== 4. VALIDACIÓN DE PUNTOS DEL CLIENTE =====
+      // ===== 4. VALIDACIONES CENTRALIZADAS =====
+      // Validar stock suficiente para todos los productos
+      await this.validationService.validarStockMultiple(
+        createVentaDto.listaProductos.map(item => ({
+          productoId: item.productoId,
+          cantidad: item.cantidad
+        }))
+      );
+
+      // Validar puntos si se van a usar
       if (createVentaDto.puntosUsados && createVentaDto.puntosUsados > 0) {
         if (!cliente) {
           throw new BadRequestException('No se pueden usar puntos sin cliente');
         }
-        if (cliente.puntosAcumulados < createVentaDto.puntosUsados) {
-          throw new BadRequestException(
-            `El cliente solo tiene ${cliente.puntosAcumulados} puntos, no puede usar ${createVentaDto.puntosUsados}`,
-          );
-        }
+        await this.validationService.validarPuntosSuficientes(cliente.id, createVentaDto.puntosUsados);
+        
+        // Validar límite de puntos por productos (máximo 50% del valor)
+        await this.validationService.validarLimitePuntosPorProductos(
+          createVentaDto.listaProductos.map(item => ({
+            productoId: item.productoId,
+            cantidad: item.cantidad
+          })),
+          createVentaDto.puntosUsados
+        );
+        
         this.logger.debug(
           `✓ Puntos validados: ${cliente.puntosAcumulados} >= ${createVentaDto.puntosUsados}`,
         );
       }
+
+      // Validar montos coherentes
+      const totalCalculado = MoneyUtil.sum(
+        productosValidados.map(p => p.subtotal)
+      ) - (createVentaDto.descuento || 0) + (createVentaDto.recargoExtra || 0);
+      
+      await this.validationService.validarMontosCoherentes(totalCalculado, totalPagado);
 
       // ===== 5. GENERAR TICKET ID =====
       const ticketId = await this._generarTicketId(queryRunner);
@@ -185,33 +214,35 @@ export class VentasService {
         `✓ Venta y ${pagosNormalizados.length} pagos guardados - ID: ${ventaGuardada.id}, Ticket: ${ticketId}`,
       );
 
-      // ===== 9. DESCONTAR STOCK DE PRODUCTOS =====
-      for (const item of productosValidados) {
-        try {
-          await this.productosService.descontarStock(
-            item.codigoBarra,
-            item.cantidad,
-            cajero,
-            ventaGuardada.id,
-          );
-          this.logger.debug(`✓ Stock descontado: ${item.descripcion} (-${item.cantidad})`);
-        } catch (error) {
-          throw new InternalServerErrorException(
-            `Error descontando stock de ${item.descripcion}: ${error.message}`,
-          );
-        }
+      // ===== 9. DESCONTAR STOCK DE PRODUCTOS (usando InventarioService) =====
+      try {
+        await this.inventarioService.descontarStockPostVenta(
+          productosValidados.map(item => ({
+            productoId: item.productoId,
+            cantidad: item.cantidad,
+            descripcion: item.descripcion
+          })),
+          ventaGuardada.id,
+          cajero,
+          queryRunner
+        );
+        this.logger.debug(`✓ Stock descontado para ${productosValidados.length} productos`);
+      } catch (error) {
+        throw new InternalServerErrorException(
+          `Error descontando stock: ${error.message}`,
+        );
       }
 
-      // ===== 10. ACTUALIZAR PUNTOS DEL CLIENTE =====
+      // ===== 10. ACTUALIZAR PUNTOS DEL CLIENTE (usando PuntosService) =====
       if (cliente) {
         // Usar puntos si es necesario
         if (createVentaDto.puntosUsados && createVentaDto.puntosUsados > 0) {
           try {
-            await this.clientesService.canjearPuntos(
+            await this.puntosService.canjearPuntosEnVenta(
               cliente.id,
               createVentaDto.puntosUsados,
               ventaGuardada.id,
-              'Descuento en compra',
+              cajero
             );
             this.logger.debug(`✓ Puntos canjeados: -${createVentaDto.puntosUsados}`);
           } catch (error) {
@@ -222,11 +253,11 @@ export class VentasService {
         // Acumular puntos nuevos
         if (resumen.puntosOtorgados > 0) {
           try {
-            await this.clientesService.acumularPuntos(
+            await this.puntosService.acumularPuntosPorVenta(
               cliente.id,
               resumen.puntosOtorgados,
               ventaGuardada.id,
-              resumen.total,
+              cajero
             );
             this.logger.debug(`✓ Puntos acumulados: +${resumen.puntosOtorgados}`);
           } catch (error) {
@@ -266,6 +297,120 @@ export class VentasService {
     } finally {
       await queryRunner.release();
     }
+  }
+
+  /**
+   * Consulta cálculos de venta sin persistir
+   * Permite al frontend obtener todos los cálculos sin duplicar lógica
+   */
+  async consultarCalculosVenta(consultaDto: any): Promise<any> {
+    this.logger.debug('🔍 Iniciando consulta de cálculos de venta');
+
+    // ===== 1. VALIDAR PRODUCTOS =====
+    const productosValidados = await this._validarYProcesarProductos(
+      consultaDto.productos.map(p => ({
+        productoId: p.productoId,
+        cantidad: p.cantidad
+      })),
+      null // No necesitamos queryRunner para consultas
+    );
+
+    // ===== 2. OBTENER CLIENTE SI EXISTE =====
+    let cliente: any = null;
+    if (consultaDto.clienteId) {
+      cliente = await this.clientesService.findById(consultaDto.clienteId);
+    }
+
+    // ===== 3. VALIDACIONES CENTRALIZADAS =====
+    // Validar stock suficiente
+    await this.validationService.validarStockMultiple(
+      consultaDto.productos.map(item => ({
+        productoId: item.productoId,
+        cantidad: item.cantidad
+      }))
+    );
+
+    // Validar puntos si se van a usar
+    if (consultaDto.puntosUsados && consultaDto.puntosUsados > 0) {
+      if (!cliente) {
+        throw new BadRequestException('No se pueden usar puntos sin cliente');
+      }
+      await this.validationService.validarPuntosSuficientes(cliente.id, consultaDto.puntosUsados);
+      
+      // Validar límite de puntos por productos
+      await this.validationService.validarLimitePuntosPorProductos(
+        consultaDto.productos.map(item => ({
+          productoId: item.productoId,
+          cantidad: item.cantidad
+        })),
+        consultaDto.puntosUsados
+      );
+    }
+
+    // ===== 4. CALCULAR RESUMEN =====
+    const resumen = this._calcularResumenVenta(
+      productosValidados,
+      consultaDto.descuento || 0,
+      consultaDto.recargoExtra || 0,
+      consultaDto.puntosUsados || 0,
+      consultaDto.montoPagado
+    );
+
+    // ===== 5. GENERAR VALIDACIONES Y ALERTAS =====
+    const validaciones: Array<{
+      tipo: 'error' | 'warning' | 'info';
+      mensaje: string;
+    }> = [];
+
+    // Alertas de stock bajo
+    for (const producto of productosValidados) {
+      if (producto.stockDisponible <= 10) {
+        validaciones.push({
+          tipo: 'warning' as const,
+          mensaje: `Stock bajo para ${producto.descripcion} (${producto.stockDisponible} unidades)`
+        });
+      }
+    }
+
+    // Alerta si usa muchos puntos
+    if (consultaDto.puntosUsados && cliente && consultaDto.puntosUsados > cliente.puntosAcumulados * 0.8) {
+      validaciones.push({
+        tipo: 'info' as const,
+        mensaje: `Usando ${consultaDto.puntosUsados} de ${cliente.puntosAcumulados} puntos disponibles`
+      });
+    }
+
+    // ===== 6. CONSTRUIR RESPUESTA =====
+    const response = {
+      subtotal: resumen.subTotal,
+      descuentoPorPuntos: resumen.descuentoPorPuntos,
+      descuentoTotal: resumen.descuentoTotal,
+      recargoExtra: resumen.recargoExtra,
+      total: resumen.total,
+      ajusteRedondeo: resumen.ajusteRedondeo,
+      totalCobrado: resumen.totalCobrado,
+      puntosOtorgados: resumen.puntosOtorgados,
+      vuelto: resumen.vuelto,
+      productos: productosValidados.map(p => ({
+        productoId: p.productoId,
+        descripcion: p.descripcion,
+        cantidad: p.cantidad,
+        precioUnitario: p.precioUnitario,
+        subtotal: p.subtotal,
+        stockDisponible: p.stockDisponible
+      })),
+      cliente: cliente ? {
+        id: cliente.id,
+        nombreCompleto: cliente.nombreCompleto,
+        puntosDisponibles: cliente.puntosAcumulados,
+        puntosUsados: consultaDto.puntosUsados || 0,
+        puntosRestantes: cliente.puntosAcumulados - (consultaDto.puntosUsados || 0)
+      } : undefined,
+      validaciones
+    };
+
+    this.logger.debug(`✅ Consulta completada: Total=${resumen.totalCobrado}, Productos=${productosValidados.length}`);
+    return response;
   }
 
   async findAll(): Promise<Venta[]> {
@@ -505,6 +650,8 @@ async anularVenta(id: number, cajero: string): Promise<Venta> {
         .select([
           'COUNT(venta.id)::int as "totalVentas"',
           'COALESCE(SUM(venta.total), 0)::numeric as "totalMonto"',
+          'COALESCE(SUM(venta.total + COALESCE(venta.ajusteRedondeo, 0)), 0)::numeric as "totalCobrado"',
+          'COALESCE(SUM(venta.ajusteRedondeo), 0)::numeric as "totalAjustesRedondeo"',
           'COALESCE(AVG(venta.total), 0)::numeric as "promedioVenta"',
           'COALESCE(SUM(venta.descuento), 0)::numeric as "totalDescuentos"',
           'COALESCE(SUM(venta.recargoExtra), 0)::numeric as "totalRecargos"',
@@ -603,6 +750,8 @@ async anularVenta(id: number, cajero: string): Promise<Venta> {
       // Estadísticas básicas - usar valores directos de la consulta con casting
       totalVentas: estadisticasBasicas.totalVentas || 0,
       totalMonto: MoneyUtil.round(estadisticasBasicas.totalMonto || 0),
+      totalCobrado: MoneyUtil.round(estadisticasBasicas.totalCobrado || 0),
+      totalAjustesRedondeo: MoneyUtil.round(estadisticasBasicas.totalAjustesRedondeo || 0),
       promedioVenta: MoneyUtil.round(estadisticasBasicas.promedioVenta || 0),
       totalDescuentos: MoneyUtil.round(estadisticasBasicas.totalDescuentos || 0),
       totalRecargos: MoneyUtil.round(estadisticasBasicas.totalRecargos || 0),
@@ -692,6 +841,7 @@ async anularVenta(id: number, cajero: string): Promise<Venta> {
         precioUnitario: precio,
         subtotal: subtotalItem,
         valorPuntos: producto.valorPuntos || 0,
+        stockDisponible: producto.cantidadActual,
       });
 
       subTotal += subtotalItem;
@@ -1073,5 +1223,144 @@ async anularVenta(id: number, cajero: string): Promise<Venta> {
     } catch (error) {
       this.logger.warn(`⚠️ Excepción enviando WhatsApp: ${error.message}`);
     }
+  }
+
+  /**
+   * Previsualiza una venta sin persistir datos
+   * Calcula subtotal, promociones, puntos, redondeo y vuelto
+   * Elimina lógica del frontend y centraliza cálculos
+   */
+  async previewVenta(
+    items: Array<{ productoId: number; cantidad: number }>,
+    clienteId?: number,
+    puntosAUsar?: number,
+    montoRecibido?: number
+  ): Promise<{
+    subtotal: number;
+    descuentoPromos: number;
+    descuentoPuntos: number;
+    ajusteRedondeo: number;
+    total: number;
+    totalCobrado: number;
+    vuelto: number;
+    puntosOtorgados: number;
+    detalleItems: Array<{
+      productoId: number;
+      nombre: string;
+      precio: number;
+      cantidad: number;
+      subtotal: number;
+    }>;
+    validaciones: {
+      stockSuficiente: boolean;
+      puntosValidos: boolean;
+      mensajes: string[];
+    };
+  }> {
+    const validaciones = {
+      stockSuficiente: true,
+      puntosValidos: true,
+      mensajes: [] as string[]
+    };
+
+    // 1. Validar y obtener productos
+    const productosIds = items.map(item => item.productoId);
+    const productos = await this.productosService.findByIds(productosIds);
+
+    if (productos.length !== productosIds.length) {
+      throw new BadRequestException('Algunos productos no fueron encontrados');
+    }
+
+    // 2. Calcular subtotal y validar stock
+    let subtotal = 0;
+    const detalleItems: Array<{
+      productoId: number;
+      nombre: string;
+      precio: number;
+      cantidad: number;
+      subtotal: number;
+    }> = [];
+
+    for (const item of items) {
+      const producto = productos.find(p => p.id === item.productoId);
+      if (!producto) continue;
+
+      // Validar stock
+      if (producto.cantidadActual < item.cantidad) {
+        validaciones.stockSuficiente = false;
+        validaciones.mensajes.push(
+          `Stock insuficiente para ${producto.productoDescripcion}. Disponible: ${producto.cantidadActual}, Requerido: ${item.cantidad}`
+        );
+      }
+
+      const subtotalItem = MoneyUtil.round(producto.precio * item.cantidad);
+      subtotal += subtotalItem;
+
+      detalleItems.push({
+        productoId: producto.id,
+        nombre: producto.productoDescripcion,
+        precio: producto.precio,
+        cantidad: item.cantidad,
+        subtotal: subtotalItem,
+      });
+    }
+
+    subtotal = MoneyUtil.round(subtotal);
+
+    // 3. Aplicar promociones (TODO: implementar cuando exista PromocionesService)
+    const descuentoPromos = 0;
+
+    // 4. Aplicar descuento por puntos
+    let descuentoPuntos = 0;
+    let puntosFinales = 0;
+
+    if (clienteId && puntosAUsar && puntosAUsar > 0) {
+      try {
+        // Usar PuntosService para validar puntos (si está disponible)
+        const VALOR_PUNTO = 0.10;
+        
+        // Validación básica de límite (50% del subtotal)
+        const limitePuntos = Math.floor((subtotal * 0.5) / VALOR_PUNTO);
+        puntosFinales = Math.min(puntosAUsar, limitePuntos);
+        
+        descuentoPuntos = MoneyUtil.round(puntosFinales * VALOR_PUNTO);
+        
+        if (puntosFinales < puntosAUsar) {
+          validaciones.puntosValidos = false;
+          validaciones.mensajes.push(
+            `Solo se pueden usar ${puntosFinales} puntos para estos productos (máximo 50% del valor)`
+          );
+        }
+      } catch (error) {
+        validaciones.puntosValidos = false;
+        validaciones.mensajes.push(`Error validando puntos: ${error.message}`);
+      }
+    }
+
+    // 5. Calcular total después de descuentos
+    const totalDespuesDescuentos = MoneyUtil.round(subtotal - descuentoPromos - descuentoPuntos);
+
+    // 6. Calcular ajuste de redondeo y total cobrado
+    const ajusteRedondeo = MoneyUtil.calculateRoundingAdjustment(totalDespuesDescuentos, totalDespuesDescuentos);
+    const totalCobrado = MoneyUtil.round(totalDespuesDescuentos + ajusteRedondeo);
+
+    // 7. Calcular vuelto
+    const vuelto = montoRecibido ? MoneyUtil.round(montoRecibido - totalCobrado) : 0;
+
+    // 8. Calcular puntos otorgados (1 punto por cada S/ 10)
+    const puntosOtorgados = Math.floor(totalCobrado / 10);
+
+    return {
+      subtotal,
+      descuentoPromos,
+      descuentoPuntos,
+      ajusteRedondeo,
+      total: totalDespuesDescuentos,
+      totalCobrado,
+      vuelto,
+      puntosOtorgados,
+      detalleItems,
+      validaciones,
+    };
   }
 }

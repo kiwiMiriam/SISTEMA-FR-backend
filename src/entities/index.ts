@@ -10,3 +10,6 @@ export { Caja } from './caja.entity';
 export { Gasto } from './gasto.entity';
 export { Delivery } from './delivery.entity';
 export { MovimientoInventario } from './movimiento-inventario.entity';
+// Nuevas entidades de refactorización arquitectónica
+export { ClientePuntosMovimiento } from './cliente-puntos-movimiento.entity';
+export { Entrada } from './entrada.entity';

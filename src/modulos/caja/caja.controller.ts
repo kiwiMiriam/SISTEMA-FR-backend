@@ -32,6 +32,33 @@ export class CajaController {
 
   constructor(private readonly cajaService: CajaService) {}
 
+  @Get('estado')
+  @Roles(UserRole.ADMIN, UserRole.CAJERO)
+  @ApiOperation({ 
+    summary: 'Obtener estado actual de la caja',
+    description: 'Endpoint centralizado para determinar si existe caja abierta y obtener información completa. Elimina lógica del frontend.'
+  })
+  @ApiResponse({ 
+    status: 200, 
+    description: 'Estado de caja obtenido exitosamente',
+    schema: {
+      type: 'object',
+      properties: {
+        abierta: { type: 'boolean', example: true },
+        cajaId: { type: 'number', example: 12 },
+        usuario: { type: 'string', example: 'admin' },
+        fechaApertura: { type: 'string', format: 'date-time', example: '2026-01-09T08:00:00Z' },
+        montoInicial: { type: 'number', example: 500.00 },
+        totalVentas: { type: 'number', example: 1250.50 },
+        totalGastos: { type: 'number', example: 150.00 },
+        montoEsperado: { type: 'number', example: 1600.50 }
+      }
+    }
+  })
+  async obtenerEstadoCaja(@CurrentUser() user: Usuario) {
+    return await this.cajaService.obtenerEstadoCaja(user.username);
+  }
+
   @Post('abrir')
   @Roles(UserRole.ADMIN, UserRole.CAJERO)
   @ApiOperation({ summary: 'Abrir caja registradora' })

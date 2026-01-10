@@ -105,6 +105,47 @@ export class CajaService {
     return caja;
   }
 
+  /**
+   * Obtiene el estado actual de la caja para eliminar lógica del frontend
+   * @param cajero Usuario cajero
+   * @returns Estado de caja con información completa
+   */
+  async obtenerEstadoCaja(cajero: string): Promise<{
+    abierta: boolean;
+    cajaId?: number;
+    usuario?: string;
+    fechaApertura?: Date;
+    montoInicial?: number;
+    totalVentas?: number;
+    totalGastos?: number;
+    montoEsperado?: number;
+  }> {
+    try {
+      const caja = await this.getCajaAbierta(cajero);
+      
+      if (!caja) {
+        return { abierta: false };
+      }
+
+      const { totalVentas, totalGastos } = await this.calcularTotalesCaja(caja);
+      const montoEsperado = caja.montoInicial + totalVentas - totalGastos;
+
+      return {
+        abierta: true,
+        cajaId: caja.id,
+        usuario: caja.cajero,
+        fechaApertura: caja.fechaApertura,
+        montoInicial: caja.montoInicial,
+        totalVentas,
+        totalGastos,
+        montoEsperado,
+      };
+    } catch (error) {
+      // En caso de error, retornar estado cerrado para seguridad
+      return { abierta: false };
+    }
+  }
+
   async getResumenCajaActual(cajero: string): Promise<any> {
     const caja = await this.getCajaActual(cajero);
     const { totalVentas, totalGastos, desglosePorMetodo } = await this.calcularTotalesCaja(caja);

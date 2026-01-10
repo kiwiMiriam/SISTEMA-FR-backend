@@ -77,6 +77,10 @@ export class ProductosService {
     return producto;
   }
 
+  async findByIds(ids: number[]): Promise<Producto[]> {
+    return await this.productoRepository.findByIds(ids);
+  }
+
   async findByCodigoBarra(codigoBarra: string): Promise<Producto> {
     const producto = await this.productoRepository.findOne({ where: { codigoBarra } });
     if (!producto) {

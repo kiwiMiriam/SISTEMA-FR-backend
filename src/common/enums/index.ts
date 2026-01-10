@@ -33,7 +33,8 @@ export enum MetodoPago {
   EFECTIVO = 'EFECTIVO',
   YAPE = 'YAPE',
   PLIN = 'PLIN',
-  TARJETA = 'TARJETA'
+  TARJETA = 'TARJETA',
+  CANJE_PUNTOS = 'CANJE_PUNTOS'
 }
 
 export enum EstadoCaja {

@@ -20,6 +20,10 @@ import { WhatsappModule } from './modulos/whatsapp/whatsapp.module';
 import { ExcelModule } from './modulos/excel/excel.module';
 import { SeederModule } from './database/seeders/seeder.module';
 import { AdminModule } from './modulos/admin/admin.module';
+// Nuevos módulos de refactorización arquitectónica
+import { PuntosModule } from './modulos/puntos/puntos.module';
+import { EntradasModule } from './modulos/entradas/entradas.module';
+import { CorteModule } from './modulos/corte/corte.module';
 
 @Module({
   imports: [
@@ -81,6 +85,10 @@ import { AdminModule } from './modulos/admin/admin.module';
     ExcelModule,
     SeederModule,
     AdminModule,
+    // Nuevos módulos de refactorización arquitectónica
+    PuntosModule,
+    EntradasModule,
+    CorteModule,
   ],
   controllers: [AppController],
   providers: [AppService],

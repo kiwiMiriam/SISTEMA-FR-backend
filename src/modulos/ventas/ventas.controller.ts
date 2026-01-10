@@ -14,8 +14,10 @@ import {
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { VentasService } from './ventas.service';
 import { CreateVentaDto } from './dto/create-venta.dto';
+import { PreviewVentaDto } from './dto/preview-venta.dto';
 import { UpdateVentaComentarioDto } from './dto/update-venta-comentario.dto';
 import { SalesCutoffDto } from './dto/sales-cutoff.dto';
+import { ConsultaVentaDto, ConsultaVentaResponseDto } from './dto/consulta-venta.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -38,6 +40,89 @@ import { DateRangeDto, PaginasRangoDto } from '../../common/dto/date-range.dto';
 @ApiBearerAuth('JWT')
 export class VentasController {
   constructor(private readonly ventasService: VentasService) {}
+
+  /**
+   * Previsualizar una venta sin persistir datos
+   * Calcula subtotal, promociones, puntos, redondeo y vuelto
+   * Elimina lógica del frontend y centraliza cálculos
+   */
+  @Post('preview')
+  @Roles(UserRole.ADMIN, UserRole.CAJERO)
+  @ApiOperation({ 
+    summary: 'Previsualizar venta sin persistir datos',
+    description: 'Calcula subtotal, aplica promociones, aplica puntos, calcula redondeo y vuelto sin guardar en base de datos. Elimina lógica del frontend.'
+  })
+  @ApiResponse({ 
+    status: 200, 
+    description: 'Previsualización completada',
+    schema: {
+      type: 'object',
+      properties: {
+        subtotal: { type: 'number', example: 45.00 },
+        descuentoPromos: { type: 'number', example: 5.00 },
+        descuentoPuntos: { type: 'number', example: 6.20 },
+        ajusteRedondeo: { type: 'number', example: -0.20 },
+        total: { type: 'number', example: 33.60 },
+        totalCobrado: { type: 'number', example: 33.40 },
+        vuelto: { type: 'number', example: 1.60 },
+        puntosOtorgados: { type: 'number', example: 3 },
+        detalleItems: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              productoId: { type: 'number' },
+              nombre: { type: 'string' },
+              precio: { type: 'number' },
+              cantidad: { type: 'number' },
+              subtotal: { type: 'number' }
+            }
+          }
+        },
+        validaciones: {
+          type: 'object',
+          properties: {
+            stockSuficiente: { type: 'boolean' },
+            puntosValidos: { type: 'boolean' },
+            mensajes: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      }
+    }
+  })
+  @ApiResponse({ status: 400, description: 'Datos inválidos o productos no encontrados' })
+  async previewVenta(@Body() previewVentaDto: PreviewVentaDto) {
+    return await this.ventasService.previewVenta(
+      previewVentaDto.items,
+      previewVentaDto.clienteId,
+      previewVentaDto.puntosAUsar,
+      previewVentaDto.montoRecibido
+    );
+  }
+
+  /**
+   * Consultar cálculos de venta sin persistir
+   * - Valida productos y stock
+   * - Calcula totales, puntos y redondeo
+   * - Retorna desglose completo sin crear venta
+   * - Permite al frontend obtener datos calculados del backend
+   */
+  @Post('consulta')
+  @Roles(UserRole.ADMIN, UserRole.CAJERO)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ 
+    summary: 'Consultar cálculos de venta',
+    description: 'Obtiene todos los cálculos de una venta sin persistir. Elimina duplicación de lógica entre frontend y backend.'
+  })
+  @ApiResponse({ 
+    status: 200, 
+    description: 'Cálculos obtenidos exitosamente',
+    type: ConsultaVentaResponseDto
+  })
+  @ApiResponse({ status: 400, description: 'Datos inválidos o stock insuficiente' })
+  async consultarCalculosVenta(@Body() consultaDto: ConsultaVentaDto): Promise<ConsultaVentaResponseDto> {
+    return await this.ventasService.consultarCalculosVenta(consultaDto);
+  }
 
   /**
    * Crear una nueva venta
