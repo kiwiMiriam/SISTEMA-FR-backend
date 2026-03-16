@@ -20,6 +20,7 @@ import { WhatsappModule } from './modulos/whatsapp/whatsapp.module';
 import { ExcelModule } from './modulos/excel/excel.module';
 import { SeederModule } from './database/seeders/seeder.module';
 import { AdminModule } from './modulos/admin/admin.module';
+import { FinancialAnalysisModule } from './modulos/financial-analysis/financial-analysis.module';
 
 @Module({
   imports: [
@@ -81,6 +82,7 @@ import { AdminModule } from './modulos/admin/admin.module';
     ExcelModule,
     SeederModule,
     AdminModule,
+    FinancialAnalysisModule,
   ],
   controllers: [AppController],
   providers: [AppService],
